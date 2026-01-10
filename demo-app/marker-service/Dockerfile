@@ -8,7 +8,6 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install system dependencies required by OpenCV/marker-pdf in one layer
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         libgl1 \
@@ -20,10 +19,9 @@ RUN apt-get update && \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     uv --version > /dev/null
 
-# Pre-install requirements (uv handles retries internally)
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
 
 COPY . .
 
-CMD ["uvicorn", "api_gateway:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8100"]

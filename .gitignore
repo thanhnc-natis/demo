@@ -52,3 +52,6 @@ yarn-error.log*
 
 # Docker
 .dockerignore
+
+# Application data
+demo-app/backend/data/documents/

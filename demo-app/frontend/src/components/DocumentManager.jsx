@@ -11,7 +11,7 @@ const formatDate = (value) => {
   }
 };
 
-const DocumentManager = ({ onOpenPersonSearch }) => {
+const DocumentManager = ({ onOpenPersonSearch = () => {} }) => {
   const [documents, setDocuments] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [selectedDoc, setSelectedDoc] = useState(null);

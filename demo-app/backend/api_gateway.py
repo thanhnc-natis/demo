@@ -84,6 +84,9 @@ ingestion_queue = IngestionQueue.from_env()
 PERSON_SERVICE_URL = os.getenv("PERSON_SERVICE_URL", "http://person-service:8001")
 DOCUMENT_STORE = Path(os.getenv("DOCUMENT_STORE", "./data/documents"))
 DOCUMENT_STORE.mkdir(parents=True, exist_ok=True)
+DOCUMENT_PREVIEW_IMAGE_LIMIT = int(os.getenv("DOCUMENT_PREVIEW_IMAGE_LIMIT", "6"))
+MARKER_SERVICE_URL = (os.getenv("MARKER_SERVICE_URL") or "").rstrip("/")
+MARKER_SERVICE_TIMEOUT = float(os.getenv("MARKER_SERVICE_TIMEOUT", "120"))
 
 def _write_social_graph_to_neo4j(graph: dict):
     """Persist a simple person->account->post graph into Neo4j."""
@@ -596,10 +599,14 @@ async def _extract_entities_from_summary(summary_text: str, metadata: dict | Non
     return data
 
 
-def _extract_pdf_images(pdf_path: Path, max_images: int = 10) -> list[dict]:
+def _extract_pdf_images(pdf_path: Path, max_images: int = 10, reader: PdfReader | None = None) -> list[dict]:
     results: list[dict] = []
-    reader = PdfReader(str(pdf_path))
-    for page_index, page in enumerate(reader.pages):
+    try:
+        local_reader = reader or PdfReader(str(pdf_path))
+    except Exception as exc:
+        print(f"[Documents] Failed to open {pdf_path} for image extraction: {exc}")
+        return results
+    for page_index, page in enumerate(local_reader.pages):
         if len(results) >= max_images:
             break
         resources = page.get("/Resources")
@@ -668,6 +675,38 @@ def _extract_pdf_images(pdf_path: Path, max_images: int = 10) -> list[dict]:
                 }
             )
     return results
+
+
+def _convert_pdf_with_marker(file_path: Path, preview_limit: int = DOCUMENT_PREVIEW_IMAGE_LIMIT) -> dict | None:
+    if not MARKER_SERVICE_URL:
+        return None
+    endpoint = urllib.parse.urljoin(MARKER_SERVICE_URL + "/", "convert")
+    data = {"preview_limit": str(preview_limit)}
+    try:
+        with file_path.open("rb") as fh:
+            response = httpx.post(
+                endpoint,
+                data=data,
+                files={"file": (file_path.name, fh, "application/pdf")},
+                timeout=MARKER_SERVICE_TIMEOUT,
+            )
+    except Exception as exc:
+        print(f"[Documents] marker service unreachable: {exc}")
+        return None
+    if response.status_code >= 400:
+        print(f"[Documents] marker service error {response.status_code}: {response.text[:200]}")
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        print("[Documents] marker service returned invalid JSON")
+        return None
+    return {
+        "pages": payload.get("pages"),
+        "text": payload.get("text") or "",
+        "metadata": payload.get("metadata") or {},
+        "preview_images": payload.get("preview_images") or [],
+    }
 
 
 def _audit_llm_call(model_name, prompt_preview, success, person_identifier=None, response_preview=None, error_message=None, section=None):
@@ -785,26 +824,65 @@ def _generate_graph_report(person, level1_nodes, level2_nodes, person_profile=No
 
 def _extract_pdf_metadata(file_path: Path) -> dict:
     pages = 0
-    full_text_parts = []
     metadata = {}
+    pdf_text_parts: list[str] = []
+    preview_images: list[dict] = []
+    marker_metadata: dict = {}
     try:
         reader = PdfReader(str(file_path))
         pages = len(reader.pages)
         metadata = {k: str(v) for k, v in (reader.metadata or {}).items()}
         for page in reader.pages:
             try:
-                full_text_parts.append(page.extract_text() or "")
+                pdf_text_parts.append(page.extract_text() or "")
             except Exception:
-                full_text_parts.append("")
+                pdf_text_parts.append("")
+        try:
+            preview_images = _extract_pdf_images(
+                file_path, max_images=DOCUMENT_PREVIEW_IMAGE_LIMIT, reader=reader
+            )
+        except Exception:
+            preview_images = []
     except Exception as exc:
         print(f"[Documents] Failed to parse PDF {file_path}: {exc}")
-    full_text = "\n".join(full_text_parts).strip()
+    marker_details = _convert_pdf_with_marker(
+        file_path, preview_limit=DOCUMENT_PREVIEW_IMAGE_LIMIT
+    )
+    marker_text = ""
+    marker_metadata: dict = {}
+    if marker_details:
+        marker_text = marker_details.get("text") or ""
+        marker_metadata = marker_details.get("metadata") or {}
+        preview_images = marker_details.get("preview_images") or preview_images
+        marker_pages = marker_details.get("pages")
+        if marker_pages:
+            pages = marker_pages
+    pdf_text = "\n".join(pdf_text_parts).strip()
+    if marker_text and pdf_text:
+        full_text = marker_text if len(marker_text) >= len(pdf_text) else pdf_text
+    else:
+        full_text = marker_text or pdf_text
+    ocr_text = marker_text or ""
+    if not full_text:
+        full_text = pdf_text
+    if not preview_images:
+        try:
+            preview_images = _extract_pdf_images(
+                file_path, max_images=DOCUMENT_PREVIEW_IMAGE_LIMIT
+            )
+        except Exception:
+            preview_images = []
     excerpt = full_text[:10000]
+    text_source = "marker" if marker_text else ("pdf" if pdf_text else "unknown")
     return {
         "pages": pages,
         "full_text": full_text,
         "excerpt": excerpt,
         "metadata": metadata,
+        "ocr_text": ocr_text,
+        "preview_images": preview_images,
+        "marker_metadata": marker_metadata,
+        "text_source": text_source,
     }
 
 
@@ -1668,6 +1746,8 @@ async def kg_person_analysis(node_id: str = Query(..., description="Person eleme
     person_profile = _fetch_person_profile(person)
     mock_payload = _load_mock_person_report(person)
     if mock_payload:
+        # Add artificial latency so mocked responses resemble live processing time.
+        await asyncio.sleep(10)
         return {
             "person": mock_payload.get("person") or person,
             "level1_nodes": mock_payload.get("level1_nodes") or level1_nodes,
@@ -1719,6 +1799,12 @@ async def document_images(
             raise HTTPException(status_code=404, detail="Document not found")
     finally:
         db.close()
+    cached_preview = []
+    if rec.metadata_json:
+        cached_preview = rec.metadata_json.get("preview_images") or []
+    if cached_preview:
+        subset = cached_preview[:limit]
+        return {"document_id": doc_id, "count": len(subset), "images": subset}
     pdf_path = Path(rec.storage_path)
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="Source file not found")
@@ -1778,7 +1864,11 @@ async def upload_document(file: UploadFile = File(...)):
             text_excerpt=parsed.get("excerpt"),
             metadata_json={
                 "pdf_metadata": parsed.get("metadata") or {},
+                "marker_metadata": parsed.get("marker_metadata") or {},
                 "size_bytes": len(blob),
+                "ocr_text": parsed.get("ocr_text") or "",
+                "preview_images": parsed.get("preview_images") or [],
+                "text_source": parsed.get("text_source"),
             },
         )
         db.add(rec)
